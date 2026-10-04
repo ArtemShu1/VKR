@@ -92,12 +92,34 @@ def records_from_cbr_archives(
             capital = next((v for k, v in t123.items() if k.endswith("_123D.DBF")), None)
             if capital is not None and {"REGN", "C1", "C3"}.issubset(capital.columns):
                 capital = capital.assign(regn_gko=capital["REGN"].astype(str).str.replace(r"\.0$", "", regex=True))
-                vals = capital[capital["C1"].astype(str).str.strip() == "000"].set_index("regn_gko")["C3"]
-                frame["regulatory_capital"] = frame["regn_gko"].map(vals)
-                frame["regulatory_capital__unit"] = "thousand RUB"
-                frame["regulatory_capital__form"] = "0409123"
-                frame["regulatory_capital__row_code"] = "000"
-                frame["regulatory_capital__source"] = source_base + " (form 0409123)"
+                capital["_cbr_code"] = capital["C1"].map(_normalise_code)
+                capital["_cbr_value"] = pd.to_numeric(capital["C3"], errors="coerce")
+                # Form 0409123 provides the official capital components.  The
+                # component codes are documented in *_123N.DBF and changed
+                # only in detail between reporting standards.
+                capital_map: dict[str, tuple[str, ...]] = {
+                    "regulatory_capital": ("000",),
+                    "charter_capital": ("100.1",),
+                    "retained_earnings_prior_years": ("100.6", "200.6"),
+                    "additional_capital": ("105", "103.2"),
+                    "subordinated_debt": ("200.7", "103.3", "103.4"),
+                    "subordinated_liabilities": ("200.7", "103.3", "103.4"),
+                    "perpetual_debt_instruments": ("103.3",),
+                    "perpetual_bonds": ("103.4",),
+                }
+                for column_name, codes in capital_map.items():
+                    selected = capital[capital["_cbr_code"].isin(codes)].copy()
+                    if selected.empty:
+                        continue
+                    selected["_nonzero"] = selected["_cbr_value"].notna() & selected["_cbr_value"].ne(0)
+                    selected["_order"] = selected["_cbr_code"].map({code: idx for idx, code in enumerate(codes)})
+                    selected = selected.sort_values(["regn_gko", "_nonzero", "_order"], ascending=[True, False, True])
+                    selected = selected.drop_duplicates("regn_gko", keep="first").set_index("regn_gko")
+                    frame[column_name] = frame["regn_gko"].map(selected["_cbr_value"])
+                    frame[f"{column_name}__unit"] = "thousand RUB"
+                    frame[f"{column_name}__form"] = "0409123"
+                    frame[f"{column_name}__row_code"] = frame["regn_gko"].map(selected["_cbr_code"])
+                    frame[f"{column_name}__source"] = source_base + " (form 0409123)"
         except Exception as exc:
             log.warning("Could not read form 123 archive %s: %s", form123, exc)
     # Verified account-plan aggregates from individual form 101 (amounts are
@@ -158,9 +180,19 @@ def records_from_cbr_archives(
         ratio_code = next((c for c in ratios.columns if c.startswith("C1_3")), None)
         ratio_value = next((c for c in ratios.columns if c.startswith("C2_3")), None)
         if ratio_code and ratio_value:
-            keep = ratios[ratios[ratio_code].astype(str).str.upper().str.startswith("Н1")].copy()
+            keep = ratios[ratios[ratio_code].astype(str).str.upper().str.startswith("Н")].copy()
             keep["regn_gko"] = keep["REGN"].astype(str).str.replace(r"\.0$", "", regex=True)
-            names_by_code = {"Н1.0": "n10", "Н1.1": "n11", "Н1.2": "n12", "Н1.4": "n14"}
+            code_names = {
+                "Н1.0": "n10", "Н1.1": "n11", "Н1.2": "n12", "Н1.3": "n1_3", "Н1.4": "n14",
+                "Н2": "n2", "Н3": "n3", "Н4": "n4", "Н7": "n7", "Н9.1": "n9_1",
+                "Н10.1": "n10_1", "Н12": "n_12", "Н15": "n15", "Н15.1": "n15_1",
+                "Н16": "n16", "Н16.1": "n16_1", "Н16.2": "n16_2", "Н18": "n18",
+            }
+            names_by_code = {
+                code: code_names.get(code, "n_" + code[1:].replace(".", "_"))
+                for code in ratios[ratio_code].astype(str).str.strip().str.upper().unique()
+                if code.startswith("Н")
+            }
             for code, column_name in names_by_code.items():
                 vals = keep[keep[ratio_code].astype(str).str.upper() == code].set_index("regn_gko")[ratio_value]
                 frame[column_name] = frame["regn_gko"].map(vals)
@@ -213,13 +245,20 @@ def records_from_cbr_archives(
                 # the published values.
                 row_map: dict[str, tuple[str, ...]] = {
                     "interest_income_total": ("11000",),
+                    "interest_income_banks": ("11300", "11400"),
+                    "interest_income_clients": ("11100",),
+                    "interest_income_securities": ("11500", "11600", "11700", "11800"),
                     "commission_income": ("12000",),
+                    "equity_participation_income": ("14000",),
                     # The CBR changed the numbering of the OФР sections:
                     # 2007 uses 10000/20000/33001, 2008–2015 uses
                     # 10000/20000/31001, and the current form uses the
                     # 10001–10004/61101 codes.
                     "other_operating_income": ("16000", "28000"),
                     "interest_expense_total": ("21000", "31000"),
+                    "interest_expense_banks": ("21100", "31100"),
+                    "interest_expense_clients": ("21300", "21600", "31300", "31600"),
+                    "interest_expense_securities": ("21800", "31800"),
                     "commission_expense": ("22000", "32000", "33000"),
                     "operating_expenses": ("10004", "20000"),
                     "pretax_profit": ("01000", "02000"),
