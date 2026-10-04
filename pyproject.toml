@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "russian-bank-panel"
+version = "0.1.0"
+description = "Reproducible individual-bank panel for Russian banking-sector research"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "pandas>=2.0",
+  "openpyxl>=3.1",
+  "requests>=2.31",
+  "beautifulsoup4>=4.12",
+  "PyYAML>=6.0",
+  "xlrd>=2.0.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+bank-panel = "bank_panel.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.setuptools.packages.find]
+include = ["bank_panel*"]

@@ -1,0 +1,16 @@
+period:
+  start_year: 2007
+  end_year: 2021
+  observation_frequency: annual
+  annual_date_rule: 31 December
+sources:
+  cbr_base_url: https://www.cbr.ru
+  cbr_reporting_url: https://www.cbr.ru/banking_sector/otchetnost-kreditnykh-organizaciy/
+  analizbankov_base_url: https://analizbankov.ru
+  timeout_seconds: 60
+  user_agent: russian-bank-panel/0.1 (academic research)
+output:
+  xlsx: data/processed/bank_panel_2007_2021.xlsx
+  csv: data/processed/bank_panel_2007_2021.csv
+  sheet_name: bank_year
+  encoding: utf-8-sig

@@ -1,0 +1,4 @@
+# Optional explicit mappings for CBR row codes. Keep form and individual/group
+# scope visible when extending the panel; never add N20.* to this file.
+form_102:
+  net_profit: [61101, 61102]
