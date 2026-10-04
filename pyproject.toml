@@ -22,6 +22,7 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 bank-panel = "bank_panel.cli:main"
+bank-panel-translate = "bank_panel.translate_cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -14,10 +14,14 @@ python -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 .venv/bin/python -m pytest
 .venv/bin/python -m bank_panel.cli --raw-dir data/raw
+.venv/bin/python -m bank_panel.translate_cli
 ```
 
 Команда создаёт один лист `bank_year` в `data/processed/bank_panel_2007_2021.xlsx`
 и совместимый с Gretl файл `data/processed/bank_panel_2007_2021.csv` (UTF‑8 BOM).
+Русская версия с теми же числовыми значениями создаётся в той же папке как
+`bank_panel_2007_2021_ru.xlsx` и `bank_panel_2007_2021_ru.csv`; переводятся
+заголовки и текстовые единицы измерения, числовые ячейки не пересчитываются.
 Добавление новых наблюдений выполняется через `bank_panel.export.append_rows`,
 который заменяет дубликат по `(regn_gko, bank_name, year)` и сохраняет long format.
 
