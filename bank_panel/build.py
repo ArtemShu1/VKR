@@ -21,6 +21,34 @@ def _find_table(tables: dict[str, pd.DataFrame], suffix: str) -> pd.DataFrame | 
     return None
 
 
+def _normalise_code(value: object) -> str:
+    """Return a CBR row/account code without DBF numeric artefacts."""
+    text = str(value).strip()
+    return text[:-2] if text.endswith(".0") and text[:-2].isdigit() else text
+
+
+def _choose_source_rows(result: pd.DataFrame, code_col: str, value_col: str, codes: tuple[str, ...]) -> pd.DataFrame:
+    """Select the first available official row for each bank.
+
+    Some CBR forms publish mutually exclusive rows (for example, profit and
+    loss) and put zero in the inapplicable row.  We preserve the value from
+    the applicable row and retain its code in the provenance column; no
+    arithmetic or sign conversion is performed.
+    """
+    work = result.copy()
+    work["_cbr_code"] = work[code_col].map(_normalise_code)
+    work["_cbr_value"] = pd.to_numeric(work[value_col], errors="coerce")
+    work = work[work["_cbr_code"].isin(codes)].copy()
+    if work.empty:
+        return work
+    # Prefer a non-zero value when a profit/loss pair is present.  Zero is a
+    # legitimate value, so it remains the fallback if all alternatives are 0.
+    work["_nonzero"] = work["_cbr_value"].notna() & work["_cbr_value"].ne(0)
+    work["_order"] = work["_cbr_code"].map({code: index for index, code in enumerate(codes)})
+    work = work.sort_values(["regn_gko", "_nonzero", "_order"], ascending=[True, False, True])
+    return work.drop_duplicates("regn_gko", keep="first")
+
+
 def records_from_cbr_archives(
     *,
     year: int,
@@ -38,6 +66,7 @@ def records_from_cbr_archives(
     can be extended in `config/code_map.yml` without changing the pipeline.
     """
     names: pd.DataFrame | None = None
+    t102: dict[str, pd.DataFrame] = {}
     if form135:
         t135 = read_archive(form135)
         names = _find_table(t135, "_135B.DBF")
@@ -47,10 +76,10 @@ def records_from_cbr_archives(
     # Form 135 was introduced after the earliest requested years. Form 102's
     # individual NP/N registry is the official fallback for 2007-2010.
     if names is None and form102:
-        t102_for_names = read_archive(form102)
-        names = _find_table(t102_for_names, "NP1.DBF")
+        t102 = read_archive(form102)
+        names = _find_table(t102, "NP1.DBF")
         if names is None:
-            names = _find_table(t102_for_names, "_NP.DBF")
+            names = _find_table(t102, "_NP.DBF")
     if names is None:
         raise ValueError("no individual bank registry table found in form 135 or form 102")
     names = names.rename(columns={"REGN": "regn_gko", "NAME_B": "bank_name"})[["regn_gko", "bank_name"]]
@@ -78,7 +107,12 @@ def records_from_cbr_archives(
     if form101:
         try:
             t101 = read_archive(form101)
-            balance = next((v for k, v in t101.items() if k.endswith("_B.DBF") or k.endswith("B1.DBF")), None)
+            # B1 is the detailed bank-by-account table.  Some older archives
+            # contain a small *_B summary table as well; choosing it first
+            # silently drops almost all banks.
+            balance = next((v for k, v in t101.items() if k.endswith("B1.DBF")), None)
+            if balance is None:
+                balance = next((v for k, v in t101.items() if k.endswith("_B.DBF")), None)
             if balance is not None:
                 value_col = "ITOGO" if "ITOGO" in balance.columns else ("VITG" if "VITG" in balance.columns else None)
                 if value_col:
@@ -86,13 +120,25 @@ def records_from_cbr_archives(
                     regn_col = "REGN"
                     account_map = {
                         "charter_capital": ("102",),
+                        "accounting_equity": ("102", "103", "104", "105", "106", "107", "108", "109"),
                         "additional_capital": ("106",),
                         "retained_earnings_prior_years": ("108",),
                         "cash": ("202",),
                         "cbr_accounts": ("30102",),
                         "interbank_placements": ("320", "321", "322", "323"),
                         "loans_individuals": ("455",),
+                        "overdue_loans": ("458", "459"),
                         "securities": ("501", "502", "503", "504", "505", "506"),
+                        "government_local_debt": ("50305", "50306"),
+                        # These are account-plan headings in form 0409101.
+                        # Values are grouped only by the explicit CBR account
+                        # prefixes; no balance-sheet identity is calculated.
+                        "loan_portfolio": tuple(str(code) for code in range(441, 460)),
+                        "loans_legal_entities": tuple(str(code) for code in range(441, 455)) + ("456",),
+                        "deposits_total": tuple(str(code) for code in range(410, 441)),
+                        "corporate_deposits": tuple(str(code) for code in range(410, 423)) + ("425",),
+                        "household_deposits": ("423", "426"),
+                        "reserves": ("10630", "10631", "20321", "30126", "30226"),
                         "mandatory_reserves_cbr": ("30201", "30202", "30203", "30204"),
                     }
                     normalized = balance[account_col].astype(str).str.replace(r"\.0$", "", regex=True)
@@ -122,11 +168,34 @@ def records_from_cbr_archives(
                 frame[f"{column_name}__form"] = "0409135"
                 frame[f"{column_name}__row_code"] = code
                 frame[f"{column_name}__source"] = source_base + " (form 0409135)"
+    # A small set of non-ratio measures is published in section 2 of the same
+    # individual form.  The code Лам is the CBR's high-liquid-assets line
+    # (used directly in the liquidity reporting); retain the original code.
+    if form135:
+        try:
+            measures = _find_table(t135, "_135_2.DBF")
+            if measures is not None and {"REGN", "C1_2", "C2_2"}.issubset(measures.columns):
+                measures = measures.assign(regn_gko=measures["REGN"].map(_normalise_code))
+                measure_map = {"Лам": "highly_liquid_assets"}
+                for source_code, column_name in measure_map.items():
+                    selected = measures[measures["C1_2"].astype(str).str.strip() == source_code]
+                    if selected.empty:
+                        continue
+                    vals = pd.to_numeric(selected.drop_duplicates("regn_gko").set_index("regn_gko")["C2_2"], errors="coerce")
+                    frame[column_name] = frame["regn_gko"].map(vals)
+                    frame[f"{column_name}__unit"] = "thousand RUB"
+                    frame[f"{column_name}__form"] = "0409135"
+                    frame[f"{column_name}__row_code"] = source_code
+                    frame[f"{column_name}__source"] = source_base + " (form 0409135)"
+        except Exception as exc:
+            log.warning("Could not map form 135 section 2 measures %s: %s", form135, exc)
     # Form 102 contains code/value rows. Preserve code-level provenance and map
-    # known codes only; missing forms remain explicit NaN rather than guessed.
+    # official section totals and result rows. Missing forms remain explicit
+    # NaN rather than being reconstructed from other rows.
     if form102:
         try:
-            t102 = read_archive(form102)
+            if not t102:
+                t102 = read_archive(form102)
         except Exception as exc:
             log.warning("Could not read form 102 archive %s: %s", form102, exc)
             t102 = {}
@@ -136,15 +205,45 @@ def records_from_cbr_archives(
             code = next((c for c in result if c.upper() == "CODE"), None)
             value = next((c for c in result if "ITOGO" in c.upper()), None)
             if regn and code and value:
-                # 61101 is the official CBR code for profit after tax.
-                subset = result[result[code].astype(str).isin(["61101", "61102"])].copy()
-                subset["regn_gko"] = subset[regn].astype(str).str.replace(r"\.0$", "", regex=True)
-                vals = subset.groupby("regn_gko")[value].first()
-                frame["net_profit"] = frame["regn_gko"].map(vals)
-                frame["net_profit__unit"] = "thousand RUB"
-                frame["net_profit__form"] = "0409102"
-                frame["net_profit__row_code"] = "61101/61102"
-                frame["net_profit__source"] = source_base + " (form 0409102)"
+                result = result.assign(regn_gko=result[regn].map(_normalise_code))
+                # Row codes are stable in the CBR form even when the visible
+                # labels and the set of sections change between years.  The
+                # two-code pairs are mutually exclusive profit/loss (or
+                # increase/decrease) rows and are selected without changing
+                # the published values.
+                row_map: dict[str, tuple[str, ...]] = {
+                    "interest_income_total": ("11000",),
+                    "commission_income": ("12000",),
+                    # The CBR changed the numbering of the OФР sections:
+                    # 2007 uses 10000/20000/33001, 2008–2015 uses
+                    # 10000/20000/31001, and the current form uses the
+                    # 10001–10004/61101 codes.
+                    "other_operating_income": ("16000", "28000"),
+                    "interest_expense_total": ("21000", "31000"),
+                    "commission_expense": ("22000", "32000", "33000"),
+                    "operating_expenses": ("10004", "20000"),
+                    "pretax_profit": ("01000", "02000"),
+                    "income_tax_expense": ("03000", "04000", "28201", "28202", "28101"),
+                    "net_profit": ("61101", "61102", "31001", "31002", "33001", "33002"),
+                    "comprehensive_income": ("40000", "50000"),
+                    "profit_and_comprehensive_income": ("81201", "81202"),
+                }
+                for spec in specs:
+                    if spec.form != "0409102" or spec.name not in row_map:
+                        continue
+                    codes = row_map[spec.name]
+                    selected = _choose_source_rows(result, code, value, codes)
+                    if selected.empty:
+                        continue
+                    vals = selected.set_index("regn_gko")["_cbr_value"]
+                    row_codes = selected.set_index("regn_gko")["_cbr_code"]
+                    frame[spec.name] = frame["regn_gko"].map(vals)
+                    frame[f"{spec.name}__unit"] = "thousand RUB"
+                    frame[f"{spec.name}__form"] = "0409102"
+                    # A bank can use either row of an exclusive pair. Keep the
+                    # exact selected code for auditability.
+                    frame[f"{spec.name}__row_code"] = frame["regn_gko"].map(row_codes)
+                    frame[f"{spec.name}__source"] = source_base + " (form 0409102)"
     # Always emit the complete documented schema. A missing official row is
     # represented as NA and is never silently calculated from another row.
     additions: dict[str, object] = {}
